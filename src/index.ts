@@ -24,8 +24,8 @@ const port = process.env.PORT || 3000;
 
 app.get("/folders", async (req, res) => {
   const sourceBucket = process.env.BUCKET_NAME as string;
-  const sourceKey = "test-data/";
-  const destinationBucket = process.env.BUCKET_NAME as string;
+  const sourceKey = "40020/outputdir/";
+  const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
   const destinationKey = `zip-outputs/zip-output-${Date.now()}.zip`;
 
   const objects = [];
@@ -58,16 +58,16 @@ app.get("/folders", async (req, res) => {
     });
   }
 
-  const archive = archiver("zip", {
-    zlib: { level: 9 },
-  });
+  const filteredObjects = objects.filter((object) => object.Size !== 0);
+
+  const archive = archiver("zip");
   const passThrough = new PassThrough();
   archive.pipe(passThrough);
 
   const streamObjectSize = 1024 * 1024;
   const partSize = streamObjectSize * 5;
 
-  const uploadBodyParts: Buffer[] = [];
+  const parts: { PartNumber: number; ETag: string }[] = [];
   let buffer: Buffer[] = [];
 
   const createMultipartCommand = new CreateMultipartUploadCommand({
@@ -86,7 +86,6 @@ app.get("/folders", async (req, res) => {
 
   passThrough.on("data", async (chunk: Buffer) => {
     buffer.push(chunk);
-
     const currentBufferSize = buffer.reduce(
       (acc, curr) => acc + curr.length,
       0
@@ -95,12 +94,31 @@ app.get("/folders", async (req, res) => {
     if (currentBufferSize >= partSize) {
       const partBody = Buffer.concat(buffer);
       buffer = [];
-      uploadBodyParts.push(partBody);
+
+      const uploadPartCommand = new UploadPartCommand({
+        Bucket: destinationBucket,
+        Key: destinationKey,
+        PartNumber: parts.length + 1,
+        UploadId: uploadId,
+        Body: partBody,
+      });
+
+      passThrough.pause();
+
+      const { ETag: etag } = await s3Client.send(uploadPartCommand);
+      console.log(`For part ${parts.length + 1}, ETag: ${etag}`);
+      etag &&
+        parts.push({
+          PartNumber: parts.length + 1,
+          ETag: etag,
+        });
+
+      passThrough.resume();
     }
   });
 
   passThrough.on("end", async () => {
-    if (uploadBodyParts.length > 0) {
+    if (parts.length > 0) {
       console.log(
         `Stream ended. Finalizing multipart for upload ID: ${uploadId}`
       );
@@ -109,26 +127,25 @@ app.get("/folders", async (req, res) => {
           `Buffer not empty with ${buffer.length} bytes. Uploading remaining buffer...`
         );
         const partBody = Buffer.concat(buffer);
-        uploadBodyParts.push(partBody);
+
+        await new Promise(async (resolve) => {
+          const uploadPartCommand = new UploadPartCommand({
+            Bucket: destinationBucket,
+            Key: destinationKey,
+            PartNumber: parts.length + 1,
+            UploadId: uploadId,
+            Body: partBody,
+          });
+          const { ETag: etag } = await s3Client.send(uploadPartCommand);
+          console.log(`For part ${parts.length + 1}, ETag: ${etag}`);
+          etag &&
+            parts.push({
+              PartNumber: parts.length + 1,
+              ETag: etag,
+            });
+          resolve(null);
+        });
       }
-
-      const uploadPromises = uploadBodyParts.map((partBody, index) => {
-        const uploadPartCommand = new UploadPartCommand({
-          Bucket: destinationBucket,
-          Key: destinationKey,
-          PartNumber: index + 1,
-          UploadId: uploadId,
-          Body: partBody,
-        });
-        return s3Client.send(uploadPartCommand).then(({ ETag: etag }) => {
-          return {
-            PartNumber: index + 1,
-            ETag: etag,
-          };
-        });
-      });
-
-      const parts = await Promise.all(uploadPromises);
 
       const completeMultipartCommand = new CompleteMultipartUploadCommand({
         Bucket: destinationBucket,
@@ -165,7 +182,7 @@ app.get("/folders", async (req, res) => {
     console.log(`Zip file created at destination bucket`);
   });
 
-  for (const file of objects) {
+  for (const file of filteredObjects) {
     if (!file.Key) continue;
     console.log(`Processing file: ${file.Key}`);
     let fileRangeAndLength = {
