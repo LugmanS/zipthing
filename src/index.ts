@@ -25,8 +25,8 @@ const port = process.env.PORT || 3000;
 
 app.get("/folders", async (req, res) => {
   const sourceBucket = process.env.BUCKET_NAME as string;
-  const sourceKey = "test-data/";
-  const destinationBucket = process.env.BUCKET_NAME as string;
+  const sourceKey = "40020/outputdir/";
+  const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
   const destinationKey = `zip-outputs/zip-output-${Date.now()}.zip`;
 
   console.log(`Fetching objects from source bucket: ${sourceBucket}`);
