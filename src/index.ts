@@ -1,17 +1,17 @@
 import {
-  AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   GetObjectCommand,
   ListObjectsV2Command,
-  PutObjectCommand,
   S3Client,
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
 import archiver from "archiver";
 import express from "express";
-import { PassThrough } from "stream";
 import pLimit from "p-limit";
+import { PassThrough } from "stream";
+import { v4 as uuid } from "uuid";
+import { genericInternalErrorResponse } from "./util";
 
 const app = express();
 
@@ -27,136 +27,138 @@ const s3Client = new S3Client({
 const port = process.env.PORT || 3000;
 
 app.post("/folders", async (req, res) => {
-  const { prefix } = req.body;
+  const { sourceKey, destinationKey } = req.body;
+
+  if (!sourceKey || !destinationKey) {
+    return res.status(400).json({
+      status: "error",
+      message: "Missing required parameters",
+    });
+  }
+
+  const requestId = uuid();
 
   const sourceBucket = process.env.BUCKET_NAME as string;
-  const sourceKey = prefix;
   const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
-  const destinationKey = `zip-outputs/zip-output-${Date.now()}.zip`;
 
-  console.log(`Fetching objects from source bucket: ${sourceBucket}`);
-
-  const objects = [];
-  let isTruncated = true;
+  console.log(`FETCH-OBJECT::For request ${requestId} fetching objects`);
 
   try {
+    const objects = [];
+    let isTruncated = true;
+    let continuationToken: string | undefined;
+
     while (isTruncated) {
       const listCommand = new ListObjectsV2Command({
         Bucket: sourceBucket,
         Prefix: sourceKey,
         MaxKeys: 1000,
+        ...(continuationToken && { ContinuationToken: continuationToken }),
       });
 
       const response = await s3Client.send(listCommand);
       response && response.Contents && objects.push(...response.Contents);
       isTruncated = response.IsTruncated ?? false;
+      continuationToken = response.NextContinuationToken;
     }
-  } catch (error) {
-    console.log(`Error while listing objects: ${error}`);
-    res.status(500).json({
-      status: "error",
-      message: "There was an error while listing objects",
-    });
-  }
 
-  if (objects.length === 0) {
-    return res.status(400).json({
-      status: "error",
-      message: "No objects found",
-    });
-  }
+    const filteredObjects = objects.filter((object) => object.Size !== 0);
 
-  const filteredObjects = objects.filter((object) => object.Size !== 0);
-
-  console.log(`Objects found: ${filteredObjects.length}`);
-
-  const archive = archiver("zip");
-  const passThrough = new PassThrough();
-  archive.pipe(passThrough);
-
-  const streamObjectSize = 1024 * 1024;
-  const partSize = streamObjectSize * 5;
-
-  const parts: { PartNumber: number; ETag: string }[] = [];
-  let buffer: Buffer[] = [];
-
-  const createMultipartCommand = new CreateMultipartUploadCommand({
-    Bucket: destinationBucket,
-    Key: destinationKey,
-  });
-
-  const { UploadId: uploadId } = await s3Client.send(createMultipartCommand);
-
-  if (!uploadId) {
-    return res.status(500).json({
-      status: "error",
-      message: "There was an error while creating multipart upload",
-    });
-  }
-
-  passThrough.on("data", async (chunk: Buffer) => {
-    buffer.push(chunk);
-    const currentBufferSize = buffer.reduce(
-      (acc, curr) => acc + curr.length,
-      0
+    console.log(
+      `FETCH-OBJECT::For request ${requestId} found ${filteredObjects.length} objects`
     );
 
-    if (currentBufferSize >= partSize) {
-      console.log(`Buffer full with ${currentBufferSize} bytes. Uploading...`);
-      const partBody = Buffer.concat(buffer);
-      buffer = [];
-
-      const uploadPartCommand = new UploadPartCommand({
-        Bucket: destinationBucket,
-        Key: destinationKey,
-        PartNumber: parts.length + 1,
-        UploadId: uploadId,
-        Body: partBody,
+    if (filteredObjects.length === 0) {
+      return res.status(400).json({
+        requestId,
+        status: "error",
+        message: "No objects found",
       });
+    }
 
-      passThrough.pause();
+    const archive = archiver("zip");
+    const passThrough = new PassThrough();
+    archive.pipe(passThrough);
 
-      const { ETag: etag } = await s3Client.send(uploadPartCommand);
-      console.log(`For part ${parts.length + 1}, ETag: ${etag}`);
-      etag &&
-        parts.push({
+    const partSize = 5 * 1024 * 1024;
+
+    const parts: { PartNumber: number; ETag: string }[] = [];
+    let buffer: Buffer[] = []; // held in memory until part size is reached
+
+    const createMultipartCommand = new CreateMultipartUploadCommand({
+      Bucket: destinationBucket,
+      Key: destinationKey,
+    });
+
+    const { UploadId: uploadId } = await s3Client.send(createMultipartCommand);
+
+    if (!uploadId) {
+      return res.status(500).json(genericInternalErrorResponse(requestId));
+    }
+
+    passThrough.on("data", async (chunk: Buffer) => {
+      buffer.push(chunk);
+      const currentBufferSize = buffer.reduce(
+        (acc, curr) => acc + curr.length,
+        0
+      );
+
+      if (currentBufferSize >= partSize) {
+        const partBody = Buffer.concat(buffer);
+        buffer = [];
+
+        const uploadPartCommand = new UploadPartCommand({
+          Bucket: destinationBucket,
+          Key: destinationKey,
           PartNumber: parts.length + 1,
-          ETag: etag,
+          UploadId: uploadId,
+          Body: partBody,
         });
 
-      passThrough.resume();
-    }
-  });
+        passThrough.pause();
 
-  passThrough.on("end", async () => {
-    if (parts.length > 0) {
-      console.log(
-        `Stream ended. Finalizing multipart for upload ID: ${uploadId}`
-      );
-      if (buffer.length > 0) {
+        const { ETag: etag } = await s3Client.send(uploadPartCommand);
+        etag &&
+          parts.push({
+            PartNumber: parts.length + 1,
+            ETag: etag,
+          });
         console.log(
-          `Buffer not empty with ${buffer.length} bytes. Uploading remaining buffer...`
+          `UPLOAD-PART::For request ${requestId} uploaded part ${
+            parts.length + 1
+          } with ETag: ${etag}`
         );
+        passThrough.resume();
+      }
+    });
+
+    passThrough.on("end", async () => {
+      if (buffer.length > 0) {
         const partBody = Buffer.concat(buffer);
 
-        await new Promise(async (resolve) => {
-          const uploadPartCommand = new UploadPartCommand({
-            Bucket: destinationBucket,
-            Key: destinationKey,
-            PartNumber: parts.length + 1,
-            UploadId: uploadId,
-            Body: partBody,
-          });
-          const { ETag: etag } = await s3Client.send(uploadPartCommand);
-          console.log(`For part ${parts.length + 1}, ETag: ${etag}`);
-          etag &&
-            parts.push({
-              PartNumber: parts.length + 1,
-              ETag: etag,
-            });
-          resolve(null);
+        const uploadPartCommand = new UploadPartCommand({
+          Bucket: destinationBucket,
+          Key: destinationKey,
+          PartNumber: parts.length + 1,
+          UploadId: uploadId,
+          Body: partBody,
         });
+        const { ETag: etag } = await s3Client.send(uploadPartCommand);
+        console.log(
+          `UPLOAD-PART::For request ${requestId} uploaded part ${
+            parts.length + 1
+          } with ETag: ${etag}`
+        );
+        etag &&
+          parts.push({
+            PartNumber: parts.length + 1,
+            ETag: etag,
+          });
       }
+
+      console.log(
+        `UPLOAD-PARTS::For request ${requestId} finishing upload with ${parts.length} parts`
+      );
 
       const completeMultipartCommand = new CompleteMultipartUploadCommand({
         Bucket: destinationBucket,
@@ -167,63 +169,48 @@ app.post("/folders", async (req, res) => {
         UploadId: uploadId,
       });
       await s3Client.send(completeMultipartCommand);
-      console.log(`Multipart upload completed`);
-    } else {
-      console.log(`No parts found. Uploading entire object.`);
 
-      const cancelMultipartCommand = new AbortMultipartUploadCommand({
-        Bucket: destinationBucket,
-        Key: destinationKey,
-        UploadId: uploadId,
-      });
+      console.log(`UPLOAD-PARTS::For request ${requestId} completed upload`);
+    });
 
-      await s3Client.send(cancelMultipartCommand);
-      console.log(`Multipart upload aborted`);
+    const fetchFileLimit = pLimit(20); // limits to 20 concurrent requests, adjust as needed
 
-      const uploadCommand = new PutObjectCommand({
-        Bucket: destinationBucket,
-        Key: destinationKey,
-        Body: Buffer.concat(buffer),
-      });
-      await s3Client.send(uploadCommand);
+    const filePromises = filteredObjects.map((file) =>
+      fetchFileLimit(async () => {
+        if (!file.Key) return;
 
-      console.log(`Object uploaded to destination bucket`);
-    }
+        const getObjectCommand = new GetObjectCommand({
+          Bucket: sourceBucket,
+          Key: file.Key,
+        });
 
-    console.log(`Zip file created at destination bucket`);
-  });
+        const response = await s3Client.send(getObjectCommand);
+        console.log(
+          `DOWNLOAD-FILE::For request ${requestId} downloaded ${file.Key}`
+        );
+        if (!response || !response.Body) return;
+        const body = await response.Body.transformToByteArray();
+        archive.append(Buffer.from(body), {
+          name: file.Key
+            ? file.Key.substring(file.Key.lastIndexOf("/") + 1)
+            : "",
+        });
+      })
+    );
 
-  const fetchFileLimit = pLimit(20);
+    await Promise.all(filePromises);
 
-  const filePromises = filteredObjects.map((file) =>
-    fetchFileLimit(async () => {
-      console.log(`Processing file: ${file.Key}`);
-      if (!file.Key) return;
+    archive.finalize();
 
-      const getObjectCommand = new GetObjectCommand({
-        Bucket: sourceBucket,
-        Key: file.Key,
-      });
+    console.log(`DOWNLOAD-FILE::For request ${requestId} completed download`);
 
-      const response = await s3Client.send(getObjectCommand);
-      if (!response || !response.Body) return;
-      const body = await response.Body.transformToByteArray();
-      archive.append(Buffer.from(body), {
-        name: file.Key ? file.Key.substring(file.Key.lastIndexOf("/") + 1) : "",
-      });
-    })
-  );
-
-  await Promise.all(filePromises);
-
-  archive.finalize();
-
-  console.log("Archive created successfully");
-
-  res.status(200).json({
-    status: "success",
-    message: "Files processed successfully",
-  });
+    res.status(200).json({
+      status: "success",
+      message: "Files processed successfully",
+    });
+  } catch (error) {
+    console.log(error);
+  }
 });
 
 app.listen(port, () => {
