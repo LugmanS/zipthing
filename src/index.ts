@@ -11,6 +11,7 @@ import {
 import archiver from "archiver";
 import express from "express";
 import { PassThrough } from "stream";
+import pLimit from "p-limit";
 
 const app = express();
 const s3Client = new S3Client({
@@ -24,9 +25,11 @@ const port = process.env.PORT || 3000;
 
 app.get("/folders", async (req, res) => {
   const sourceBucket = process.env.BUCKET_NAME as string;
-  const sourceKey = "40020/outputdir/";
-  const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
+  const sourceKey = "test-data/";
+  const destinationBucket = process.env.BUCKET_NAME as string;
   const destinationKey = `zip-outputs/zip-output-${Date.now()}.zip`;
+
+  console.log(`Fetching objects from source bucket: ${sourceBucket}`);
 
   const objects = [];
   let isTruncated = true;
@@ -60,11 +63,13 @@ app.get("/folders", async (req, res) => {
 
   const filteredObjects = objects.filter((object) => object.Size !== 0);
 
+  console.log(`Objects found: ${filteredObjects.length}`);
+
   const archive = archiver("zip");
   const passThrough = new PassThrough();
   archive.pipe(passThrough);
 
-  const streamObjectSize = 1024 * 1024;
+  const streamObjectSize = 5 * 1024 * 1024;
   const partSize = streamObjectSize * 5;
 
   const parts: { PartNumber: number; ETag: string }[] = [];
@@ -182,52 +187,33 @@ app.get("/folders", async (req, res) => {
     console.log(`Zip file created at destination bucket`);
   });
 
-  for (const file of filteredObjects) {
-    if (!file.Key) continue;
-    console.log(`Processing file: ${file.Key}`);
-    let fileRangeAndLength = {
-      start: -1,
-      end: -1,
-      length: -1,
-    };
+  const fetchFileLimit = pLimit(20);
 
-    while (fileRangeAndLength.end !== fileRangeAndLength.length - 1) {
-      const { end } = fileRangeAndLength;
-      const nextRange = {
-        start: end + 1,
-        end: end + streamObjectSize,
-      };
+  const filePromises = filteredObjects.map((file) =>
+    fetchFileLimit(async () => {
+      console.log(`Processing file: ${file.Key}`);
+      if (!file.Key) return;
 
       const getObjectCommand = new GetObjectCommand({
         Bucket: sourceBucket,
         Key: file.Key,
-        Range: `bytes=${nextRange.start}-${nextRange.end}`,
       });
 
-      const response = await s3Client.send(getObjectCommand);
-      if (!response || !response.ContentRange || !response.Body) continue;
-
-      const body = await response.Body.transformToByteArray();
-
-      archive.append(Buffer.from(body), {
-        name: file.Key.substring(file.Key.lastIndexOf("/") + 1),
+      await s3Client.send(getObjectCommand).then(async (response) => {
+        if (!response || !response.Body) return;
+        const body = await response.Body.transformToByteArray();
+        archive.append(Buffer.from(body), {
+          name: file.Key
+            ? file.Key.substring(file.Key.lastIndexOf("/") + 1)
+            : "",
+        });
       });
+    })
+  );
 
-      const [range, length] = response.ContentRange.split("/") as [
-        string,
-        string
-      ];
-      const [newStart, newEnd] = range.split("-") as [string, string];
-      fileRangeAndLength = {
-        start: parseInt(newStart),
-        end: parseInt(newEnd),
-        length: parseInt(length),
-      };
-    }
-    console.log(`Processed file: ${file.Key}`);
-  }
+  await Promise.all(filePromises);
 
-  await archive.finalize();
+  archive.finalize();
 
   console.log("Archive created successfully");
 

@@ -26,6 +26,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.598.0",
     "archiver": "^7.0.1",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "p-limit": "^5.0.0"
   }
 }
