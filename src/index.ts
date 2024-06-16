@@ -14,6 +14,9 @@ import { PassThrough } from "stream";
 import pLimit from "p-limit";
 
 const app = express();
+
+app.use(express.json());
+
 const s3Client = new S3Client({
   region: process.env.REGION || "ap-south-1",
   credentials: {
@@ -23,9 +26,11 @@ const s3Client = new S3Client({
 });
 const port = process.env.PORT || 3000;
 
-app.get("/folders", async (req, res) => {
+app.post("/folders", async (req, res) => {
+  const { prefix } = req.body;
+
   const sourceBucket = process.env.BUCKET_NAME as string;
-  const sourceKey = "40020/outputdir/";
+  const sourceKey = prefix;
   const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
   const destinationKey = `zip-outputs/zip-output-${Date.now()}.zip`;
 
@@ -69,7 +74,7 @@ app.get("/folders", async (req, res) => {
   const passThrough = new PassThrough();
   archive.pipe(passThrough);
 
-  const streamObjectSize = 5 * 1024 * 1024;
+  const streamObjectSize = 1024 * 1024;
   const partSize = streamObjectSize * 5;
 
   const parts: { PartNumber: number; ETag: string }[] = [];
@@ -97,6 +102,7 @@ app.get("/folders", async (req, res) => {
     );
 
     if (currentBufferSize >= partSize) {
+      console.log(`Buffer full with ${currentBufferSize} bytes. Uploading...`);
       const partBody = Buffer.concat(buffer);
       buffer = [];
 
@@ -199,14 +205,11 @@ app.get("/folders", async (req, res) => {
         Key: file.Key,
       });
 
-      await s3Client.send(getObjectCommand).then(async (response) => {
-        if (!response || !response.Body) return;
-        const body = await response.Body.transformToByteArray();
-        archive.append(Buffer.from(body), {
-          name: file.Key
-            ? file.Key.substring(file.Key.lastIndexOf("/") + 1)
-            : "",
-        });
+      const response = await s3Client.send(getObjectCommand);
+      if (!response || !response.Body) return;
+      const body = await response.Body.transformToByteArray();
+      archive.append(Buffer.from(body), {
+        name: file.Key ? file.Key.substring(file.Key.lastIndexOf("/") + 1) : "",
       });
     })
   );
