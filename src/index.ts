@@ -38,6 +38,8 @@ app.post("/folders", async (req, res) => {
 
   const requestId = uuid();
 
+  console.log(`CREATE-REQUEST::For request ${requestId}`);
+
   const sourceBucket = process.env.BUCKET_NAME as string;
   const destinationBucket = process.env.AWS_S3_ZIP_BUCKET_NAME as string;
 
@@ -107,10 +109,12 @@ app.post("/folders", async (req, res) => {
         const partBody = Buffer.concat(buffer);
         buffer = [];
 
+        const partNumber = parts.length + 1;
+
         const uploadPartCommand = new UploadPartCommand({
           Bucket: destinationBucket,
           Key: destinationKey,
-          PartNumber: parts.length + 1,
+          PartNumber: partNumber,
           UploadId: uploadId,
           Body: partBody,
         });
@@ -120,7 +124,7 @@ app.post("/folders", async (req, res) => {
         const { ETag: etag } = await s3Client.send(uploadPartCommand);
         etag &&
           parts.push({
-            PartNumber: parts.length + 1,
+            PartNumber: partNumber,
             ETag: etag,
           });
         console.log(
@@ -170,31 +174,57 @@ app.post("/folders", async (req, res) => {
       });
       await s3Client.send(completeMultipartCommand);
 
+      passThrough.destroy();
+
       console.log(`UPLOAD-PARTS::For request ${requestId} completed upload`);
     });
 
     const fetchFileLimit = pLimit(20); // limits to 20 concurrent requests, adjust as needed
+    const streamObjectSize = 1024 * 1024;
 
     const filePromises = filteredObjects.map((file) =>
       fetchFileLimit(async () => {
         if (!file.Key) return;
 
-        const getObjectCommand = new GetObjectCommand({
-          Bucket: sourceBucket,
-          Key: file.Key,
-        });
+        let fileRangeAndLength = {
+          start: -1,
+          end: -1,
+          length: -1,
+        };
 
-        const response = await s3Client.send(getObjectCommand);
-        console.log(
-          `DOWNLOAD-FILE::For request ${requestId} downloaded ${file.Key}`
-        );
-        if (!response || !response.Body) return;
-        const body = await response.Body.transformToByteArray();
-        archive.append(Buffer.from(body), {
-          name: file.Key
-            ? file.Key.substring(file.Key.lastIndexOf("/") + 1)
-            : "",
-        });
+        while (fileRangeAndLength.end !== fileRangeAndLength.length - 1) {
+          const { end } = fileRangeAndLength;
+          const nextRange = {
+            start: end + 1,
+            end: end + streamObjectSize,
+          };
+
+          const getObjectCommand = new GetObjectCommand({
+            Bucket: sourceBucket,
+            Key: file.Key,
+            Range: `bytes=${nextRange.start}-${nextRange.end}`,
+          });
+
+          const response = await s3Client.send(getObjectCommand);
+          if (!response || !response.ContentRange || !response.Body) continue;
+
+          const body = await response.Body.transformToByteArray();
+
+          archive.append(Buffer.from(body), {
+            name: file.Key.substring(file.Key.lastIndexOf("/") + 1),
+          });
+
+          const [range, length] = response.ContentRange.split("/") as [
+            string,
+            string
+          ];
+          const [newStart, newEnd] = range.split("-") as [string, string];
+          fileRangeAndLength = {
+            start: parseInt(newStart),
+            end: parseInt(newEnd),
+            length: parseInt(length),
+          };
+        }
       })
     );
 
