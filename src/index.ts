@@ -109,12 +109,10 @@ app.post("/folders", async (req, res) => {
         const partBody = Buffer.concat(buffer);
         buffer = [];
 
-        const partNumber = parts.length + 1;
-
         const uploadPartCommand = new UploadPartCommand({
           Bucket: destinationBucket,
           Key: destinationKey,
-          PartNumber: partNumber,
+          PartNumber: parts.length + 1,
           UploadId: uploadId,
           Body: partBody,
         });
@@ -124,7 +122,7 @@ app.post("/folders", async (req, res) => {
         const { ETag: etag } = await s3Client.send(uploadPartCommand);
         etag &&
           parts.push({
-            PartNumber: partNumber,
+            PartNumber: parts.length + 1,
             ETag: etag,
           });
         console.log(
@@ -185,7 +183,9 @@ app.post("/folders", async (req, res) => {
     const filePromises = filteredObjects.map((file) =>
       fetchFileLimit(async () => {
         if (!file.Key) return;
-
+        console.log(
+          `DOWNLOAD-FILE::For request ${requestId} downloading ${file.Key}`
+        );
         let fileRangeAndLength = {
           start: -1,
           end: -1,
